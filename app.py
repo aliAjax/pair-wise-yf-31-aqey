@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, time, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -96,8 +97,66 @@ class Repository:
                 missed_connections INTEGER NOT NULL DEFAULT 0, UNIQUE(plan_id,flight_id)
             );
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """
         )
+        self._migrate()
+
+    # 离线批次相关表在 v2 迁移中建立，迁移只新增表、不动旧表数据，
+    # 以保留原方案、修订号与审计记录。
+    def _migrate(self) -> None:
+        row = self.conn.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
+        version = int(row["value"]) if row else 1
+        if version >= 2:
+            return
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS offline_batches(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_key TEXT NOT NULL UNIQUE,
+                plan_id INTEGER NOT NULL REFERENCES recovery_plans(id),
+                baseline_revision INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                checkpoint INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                submitted_by TEXT NOT NULL,
+                submitted_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                result_json TEXT,
+                error_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS batch_operations(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL REFERENCES offline_batches(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                op TEXT NOT NULL DEFAULT 'reassign',
+                flight_id INTEGER NOT NULL REFERENCES flights(id),
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                result_json TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(batch_id, seq)
+            );
+            CREATE TABLE IF NOT EXISTS batch_conflicts(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL REFERENCES offline_batches(id) ON DELETE CASCADE,
+                operation_id INTEGER REFERENCES batch_operations(id) ON DELETE CASCADE,
+                flight_id INTEGER REFERENCES flights(id),
+                code TEXT NOT NULL,
+                detail_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                resolution_note TEXT,
+                resolved_by TEXT,
+                resolved_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_batch_ops_batch ON batch_operations(batch_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_batches_plan_status ON offline_batches(plan_id, status);
+            CREATE INDEX IF NOT EXISTS idx_batch_conflicts_status ON batch_conflicts(batch_id, status);
+            """
+        )
+        self.conn.execute("INSERT OR IGNORE INTO schema_meta(key,value) VALUES('version','2')")
+        Repository.audit(self.conn, None, "system", "system", "schema_upgraded", {"from": version, "to": 2})
 
     @staticmethod
     def audit(conn: sqlite3.Connection, plan_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -406,11 +465,239 @@ class AirlineRecoveryService:
         plans.sort(key=lambda item: item["score"]["cost_score"] if item["score"] else 10**18)
         return {"disruption_id": disruption_id, "recommended_plan_id": plans[0]["id"] if plans else None, "plans": plans}
 
+    def submit_batch(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "batch_forbidden", "当前角色不能提交离线批次")
+        batch_key = str(body.get("batch_key", "")).strip()
+        baseline = body.get("baseline_revision")
+        operations = body.get("operations", [])
+        if not batch_key: raise ApiError(400, "batch_key_required", "batch_key 必填且用于幂等重试")
+        if not isinstance(baseline, int): raise ApiError(400, "revision_required", "baseline_revision 必须是整数")
+        if not isinstance(operations, list) or not operations: raise ApiError(400, "invalid_batch", "operations 必须是非空列表")
+        normalized: list[dict[str, Any]] = []
+        seen_seq: set[int] = set()
+        for item in operations:
+            if not isinstance(item, dict): raise ApiError(400, "invalid_operation", "每个操作必须是对象")
+            seq = item.get("seq")
+            if not isinstance(seq, int) or seq in seen_seq: raise ApiError(400, "invalid_seq", "seq 必须是批次内唯一整数")
+            seen_seq.add(seq)
+            flight_id = item.get("flight_id")
+            if not isinstance(flight_id, int): raise ApiError(400, "invalid_operation", "flight_id 必须是整数")
+            payload = {"aircraft_id": str(item.get("aircraft_id", "")).strip(), "crew_id": str(item.get("crew_id", "")).strip(),
+                       "new_std": item.get("new_std"), "new_sta": item.get("new_sta"),
+                       "missed_connections": item.get("missed_connections", 0), "status": item.get("status", "planned")}
+            if not payload["aircraft_id"] or not payload["crew_id"] or not payload["new_std"] or not payload["new_sta"]:
+                raise ApiError(400, "invalid_operation", "改派缺少 aircraft_id、crew_id、new_std 或 new_sta")
+            normalized.append({"seq": seq, "op": str(item.get("op", "reassign")), "flight_id": flight_id, "payload": payload})
+        with self.repo.tx() as conn:
+            plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+            if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+            if plan["status"] != "draft": raise ApiError(409, "plan_locked", "已锁定方案不能接收离线批次")
+            existing = conn.execute("SELECT * FROM offline_batches WHERE batch_key=?", (batch_key,)).fetchone()
+            if existing:
+                batch_id = existing["id"]
+            else:
+                cur = conn.execute("""INSERT INTO offline_batches(batch_key,plan_id,baseline_revision,status,submitted_by,submitted_at,updated_at)
+                                     VALUES(?,?,?,?,?,?,?)""", (batch_key, plan_id, baseline, "queued", actor, iso(), iso()))
+                batch_id = cur.lastrowid
+                for op in normalized:
+                    conn.execute("""INSERT INTO batch_operations(batch_id,seq,op,flight_id,payload_json,status,created_at)
+                                    VALUES(?,?,?,?,?,?,?)""",
+                                 (batch_id, op["seq"], op["op"], op["flight_id"], json.dumps(op["payload"], ensure_ascii=False, sort_keys=True), "pending", iso()))
+                Repository.audit(conn, plan_id, actor, role, "batch_submitted",
+                                {"batch_id": batch_id, "batch_key": batch_key, "operation_count": len(normalized), "baseline_revision": baseline})
+        self._process_batch(batch_id)
+        return self.get_batch(batch_id)
+
+    def list_batches(self, plan_id: int) -> list[dict[str, Any]]:
+        conn = self.repo.conn
+        if not conn.execute("SELECT 1 FROM recovery_plans WHERE id=?", (plan_id,)).fetchone():
+            raise ApiError(404, "plan_not_found", "方案不存在")
+        rows = conn.execute("""SELECT b.*,
+                                      (SELECT COUNT(*) FROM batch_operations o WHERE o.batch_id=b.id) operation_count,
+                                      (SELECT COUNT(*) FROM batch_conflicts c WHERE c.batch_id=b.id AND c.status='pending') pending_conflict_count
+                               FROM offline_batches b WHERE b.plan_id=? ORDER BY b.id DESC""", (plan_id,)).fetchall()
+        return [self._batch_summary(dict(r)) for r in rows]
+
+    def get_batch(self, batch_id: int) -> dict[str, Any]:
+        conn = self.repo.conn
+        batch = conn.execute("SELECT * FROM offline_batches WHERE id=?", (batch_id,)).fetchone()
+        if not batch: raise ApiError(404, "batch_not_found", "离线批次不存在")
+        result = self._batch_summary(dict(batch))
+        result["operations"] = [dict(r) for r in conn.execute("SELECT * FROM batch_operations WHERE batch_id=? ORDER BY seq", (batch_id,))]
+        result["conflicts"] = [dict(r) for r in conn.execute("SELECT * FROM batch_conflicts WHERE batch_id=? ORDER BY id", (batch_id,))]
+        return result
+
+    @staticmethod
+    def _batch_summary(batch: dict[str, Any]) -> dict[str, Any]:
+        result = dict(batch)
+        result["result"] = json.loads(batch["result_json"]) if batch.get("result_json") else None
+        result["error"] = json.loads(batch["error_json"]) if batch.get("error_json") else None
+        result.pop("result_json", None); result.pop("error_json", None)
+        return result
+
+    def retry_batch(self, batch_id: int, actor: str, role: str) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager", "auditor"}: raise ApiError(403, "batch_forbidden", "当前角色不能重试批次")
+        conn = self.repo.conn
+        batch = conn.execute("SELECT * FROM offline_batches WHERE id=?", (batch_id,)).fetchone()
+        if not batch: raise ApiError(404, "batch_not_found", "离线批次不存在")
+        if batch["status"] not in ("failed", "conflict"):
+            raise ApiError(409, "batch_not_retryable", "只有失败或存在待处理冲突的批次可以重试")
+        Repository.audit(conn, batch["plan_id"], actor, role, "batch_retried", {"batch_id": batch_id})
+        self._process_batch(batch_id)
+        return self.get_batch(batch_id)
+
+    def resolve_conflict(self, batch_id: int, conflict_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "batch_forbidden", "当前角色不能处理冲突")
+        resolution = str(body.get("resolution", "")).strip()
+        note = str(body.get("note", "")).strip()
+        if resolution not in {"ignored", "resolved"}: raise ApiError(400, "invalid_resolution", "resolution 必须是 ignored 或 resolved")
+        with self.repo.tx() as conn:
+            conflict = conn.execute("SELECT * FROM batch_conflicts WHERE id=? AND batch_id=?", (conflict_id, batch_id)).fetchone()
+            if not conflict: raise ApiError(404, "conflict_not_found", "待处理冲突不存在")
+            batch = conn.execute("SELECT plan_id FROM offline_batches WHERE id=?", (batch_id,)).fetchone()
+            conn.execute("UPDATE batch_conflicts SET status=?,resolution_note=?,resolved_by=?,resolved_at=? WHERE id=?",
+                         (resolution, note, actor, iso(), conflict_id))
+            Repository.audit(conn, batch["plan_id"] if batch else None, actor, role,
+                            "batch_conflict_resolved", {"batch_id": batch_id, "conflict_id": conflict_id, "resolution": resolution})
+        return self.get_batch(batch_id)
+
+    def _apply_operation(self, conn: sqlite3.Connection, plan_id: int, op: dict[str, Any]) -> None:
+        payload = json.loads(op["payload_json"])
+        flight_id = op["flight_id"]
+        plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+        if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+        if plan["status"] != "draft": raise ApiError(409, "plan_locked", "已锁定方案不能修改")
+        std, sta = parse_time(payload["new_std"]), parse_time(payload["new_sta"])
+        if sta <= std: raise ApiError(400, "invalid_times", "新到达时间必须晚于新起飞时间")
+        flight = conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
+        if not flight: raise ApiError(404, "flight_not_found", "航班不存在")
+        if flight["status"] == "canceled" and payload.get("status", "planned") != "canceled":
+            raise ApiError(409, "canceled_flight", "已取消航班不能安排执行")
+        delay = int((std - parse_time(flight["std"])).total_seconds() // 60)
+        missed = int(payload.get("missed_connections", 0))
+        if missed < 0: raise ApiError(400, "invalid_connections", "missed_connections 不能为负")
+        conn.execute("""INSERT INTO assignments(plan_id,flight_id,aircraft_id,crew_id,new_std,new_sta,status,delay_minutes,missed_connections)
+                        VALUES(?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(plan_id,flight_id) DO UPDATE SET aircraft_id=excluded.aircraft_id,crew_id=excluded.crew_id,
+                        new_std=excluded.new_std,new_sta=excluded.new_sta,status=excluded.status,delay_minutes=excluded.delay_minutes,
+                        missed_connections=excluded.missed_connections""",
+                     (plan_id, flight_id, payload["aircraft_id"], payload["crew_id"], iso(std), iso(sta),
+                      payload.get("status", "planned"), delay, missed))
+
+    def _locked_resource_conflicts(self, conn: sqlite3.Connection, plan_id: int) -> list[dict[str, Any]]:
+        rows = [dict(r) for r in conn.execute("""SELECT a.*, f.flight_no FROM assignments a JOIN flights f ON f.id=a.flight_id
+                                                 WHERE a.plan_id=? AND a.status!='canceled'""", (plan_id,)).fetchall()]
+        conflicts: list[dict[str, Any]] = []
+        for row in rows:
+            for item in conn.execute("""SELECT a.*, p.name plan_name FROM assignments a JOIN recovery_plans p ON p.id=a.plan_id
+                                         WHERE p.id!=? AND p.status='locked' AND a.status!='canceled'
+                                         AND (a.aircraft_id=? OR a.crew_id=?) AND a.new_std<? AND a.new_sta>?""",
+                                     (plan_id, row["aircraft_id"], row["crew_id"], row["new_sta"], row["new_std"])).fetchall():
+                resource = item["aircraft_id"] if item["aircraft_id"] == row["aircraft_id"] else item["crew_id"]
+                conflicts.append({"assignment_id": row["id"], "flight_id": row["flight_id"], "flight_no": row["flight_no"],
+                                  "conflict_plan_id": item["plan_id"], "conflict_plan": item["plan_name"], "resource": resource,
+                                  "new_std": row["new_std"], "new_sta": row["new_sta"]})
+        return conflicts
+
+    def _process_batch(self, batch_id: int) -> None:
+        conn = self.repo.conn
+        batch = conn.execute("SELECT * FROM offline_batches WHERE id=?", (batch_id,)).fetchone()
+        if not batch or batch["status"] == "merged": return
+        plan_id = batch["plan_id"]
+        conn.execute("UPDATE offline_batches SET status='processing',attempts=attempts+1,updated_at=? WHERE id=?", (iso(), batch_id))
+        conn.commit()
+        ops = [dict(r) for r in conn.execute("SELECT * FROM batch_operations WHERE batch_id=? ORDER BY seq", (batch_id,)).fetchall()]
+        # 同一航班只认最后一次改派：按 flight_id 取 seq 最大的 reassign。
+        effective: dict[int, dict[str, Any]] = {}
+        for op in ops:
+            if op["op"] != "reassign": continue
+            if op["flight_id"] not in effective or op["seq"] > effective[op["flight_id"]]["seq"]:
+                effective[op["flight_id"]] = op
+        for op in ops:
+            if op["status"] != "pending": continue
+            eff = effective.get(op["flight_id"])
+            if not eff or eff["id"] != op["id"]:
+                conn.execute("UPDATE batch_operations SET status='superseded' WHERE id=?", (op["id"],))
+        conn.commit()
+        checkpoint = batch["checkpoint"]
+        for op in sorted(effective.values(), key=lambda item: item["seq"]):
+            if op["status"] == "applied" and op["seq"] <= checkpoint:
+                continue
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._apply_operation(conn, plan_id, op)
+                conn.execute("UPDATE batch_operations SET status='applied',result_json=? WHERE id=?",
+                             (json.dumps({"applied": True}, ensure_ascii=False), op["id"]))
+                conn.execute("UPDATE offline_batches SET checkpoint=?,updated_at=? WHERE id=?", (op["seq"], iso(), batch_id))
+                conn.commit()
+            except ApiError as exc:
+                conn.execute("ROLLBACK")
+                conn.execute("UPDATE batch_operations SET status='failed',result_json=? WHERE id=?",
+                             (json.dumps({"code": exc.code, "message": exc.message}, ensure_ascii=False), op["id"]))
+                conn.execute("UPDATE offline_batches SET status='failed',error_json=?,updated_at=? WHERE id=?",
+                             (json.dumps({"code": exc.code, "message": exc.message, "operation_seq": op["seq"]}, ensure_ascii=False), iso(), batch_id))
+                conn.commit()
+                return
+            except Exception as exc:
+                conn.execute("ROLLBACK")
+                conn.execute("UPDATE offline_batches SET status='failed',error_json=?,updated_at=? WHERE id=?",
+                             (json.dumps({"code": "internal_error", "message": str(exc), "operation_seq": op["seq"]}, ensure_ascii=False), iso(), batch_id))
+                conn.commit()
+                return
+        # 合并后重新校验飞机、机组、航线许可，并检查锁定方案资源冲突。
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM batch_conflicts WHERE batch_id=?", (batch_id,))
+        try:
+            problems = self._validate_plan(conn, plan_id)
+        except ApiError as exc:
+            problems = [{"code": exc.code, "message": exc.message}]
+        locked = self._locked_resource_conflicts(conn, plan_id)
+        if problems or locked:
+            for problem in problems:
+                conn.execute("""INSERT INTO batch_conflicts(batch_id,operation_id,flight_id,code,detail_json,status,created_at)
+                                VALUES(?,?,?,?,?,?,?)""",
+                             (batch_id, None, problem.get("flight_id"), problem["code"],
+                              json.dumps(problem, ensure_ascii=False), "pending", iso()))
+            for conflict in locked:
+                conn.execute("""INSERT INTO batch_conflicts(batch_id,operation_id,flight_id,code,detail_json,status,created_at)
+                                VALUES(?,?,?,?,?,?,?)""",
+                             (batch_id, None, conflict["flight_id"], "locked_resource_conflict",
+                              json.dumps(conflict, ensure_ascii=False), "pending", iso()))
+            superseded = len(ops) - len(effective)
+            conn.execute("UPDATE offline_batches SET status='conflict',result_json=?,updated_at=? WHERE id=?",
+                         (json.dumps({"merged": False, "validation_problems": len(problems), "locked_conflicts": len(locked),
+                                      "applied_operations": len(effective), "superseded": superseded}, ensure_ascii=False), iso(), batch_id))
+        else:
+            superseded = len(ops) - len(effective)
+            conn.execute("UPDATE recovery_plans SET revision=revision+1 WHERE id=?", (plan_id,))
+            conn.execute("UPDATE offline_batches SET status='merged',result_json=?,updated_at=? WHERE id=?",
+                         (json.dumps({"merged": True, "applied_operations": len(effective), "superseded": superseded}, ensure_ascii=False), iso(), batch_id))
+            Repository.audit(conn, plan_id, "system", "system", "batch_merged",
+                             {"batch_id": batch_id, "applied_operations": len(effective), "superseded": superseded})
+        conn.commit()
+
+    def recover_pending_batches(self) -> None:
+        conn = self.repo.conn
+        rows = conn.execute("SELECT id FROM offline_batches WHERE status IN ('queued','processing') ORDER BY id").fetchall()
+        for row in rows:
+            try:
+                self._process_batch(row["id"])
+            except Exception as exc:
+                print(f"recover batch {row['id']} failed: {exc!r}")
+
     def state(self) -> dict[str, Any]:
         conn = self.repo.conn
         flights = [dict(r) for r in conn.execute("SELECT * FROM flights ORDER BY std")]
         plans = [self.get_plan(r["id"]) for r in conn.execute("SELECT id FROM recovery_plans ORDER BY id DESC LIMIT 20")]
-        return {"flights": flights, "disruptions": [dict(r) for r in conn.execute("SELECT * FROM disruptions ORDER BY id DESC")], "plans": plans, "server_time": iso()}
+        pending_batches = [dict(r) for r in conn.execute("""SELECT b.*, p.name plan_name FROM offline_batches b
+                                                             JOIN recovery_plans p ON p.id=b.plan_id
+                                                             WHERE b.status IN ('queued','processing','conflict','failed')
+                                                             ORDER BY b.id DESC LIMIT 50""")]
+        pending_conflicts = [dict(r) for r in conn.execute("""SELECT c.*, b.plan_id FROM batch_conflicts c
+                                                              JOIN offline_batches b ON b.id=c.batch_id
+                                                              WHERE c.status='pending' ORDER BY c.id DESC LIMIT 100""")]
+        return {"flights": flights, "disruptions": [dict(r) for r in conn.execute("SELECT * FROM disruptions ORDER BY id DESC")], "plans": plans,
+                "pending_batches": pending_batches, "pending_conflicts": pending_conflicts, "server_time": iso()}
 
 
 def respond(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -435,6 +722,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state": return 200, self.service.state()
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "batches": return 200, self.service.list_batches(int(parts[2]))
+        if len(parts) == 3 and parts[:2] == ["api", "batches"] and parts[2].isdigit(): return 200, self.service.get_batch(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["api", "disruptions"] and parts[2].isdigit() and parts[3] == "compare": return 200, self.service.compare_plans(int(parts[2]))
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
@@ -454,6 +743,12 @@ class Handler(BaseHTTPRequestHandler):
             if action == "assignments": return 200, self.service.add_assignment(plan_id, actor, role, body)
             if action == "validate": return 200, self.service.validate_plan(plan_id, actor, role)
             if action == "lock": return 200, self.service.lock_plan(plan_id, actor, role, body)
+            if action == "batches": return 201, self.service.submit_batch(plan_id, actor, role, body)
+        if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[2].isdigit():
+            batch_id, action = int(parts[2]), parts[3]
+            if action == "retry": return 200, self.service.retry_batch(batch_id, actor, role)
+        if len(parts) == 6 and parts[:2] == ["api", "batches"] and parts[2].isdigit() and parts[3] == "conflicts" and parts[4].isdigit() and parts[5] == "resolve":
+            return 200, self.service.resolve_conflict(int(parts[2]), int(parts[4]), actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "flights"] and parts[2].isdigit():
             flight_id, action = int(parts[2]), parts[3]
             if action == "cancel": return 200, self.service.cancel_flight(flight_id, actor, role, body)
@@ -478,6 +773,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def create_server(db_path: str | Path, host: str = "127.0.0.1", port: int = PORT) -> ThreadingHTTPServer:
     service = AirlineRecoveryService(db_path)
+    # 进程崩溃后重启：后台恢复上次未处理完的离线批次队列与待处理冲突。
+    threading.Thread(target=service.recover_pending_batches, daemon=True).start()
     handler = type("AirlineHandler", (Handler,), {"service": service, "web_root": Path(__file__).resolve().parent / "static"})
     return ThreadingHTTPServer((host, port), handler)
 

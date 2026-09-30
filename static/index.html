@@ -1,3 +1,43 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>航班恢复控制台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#0f766e;color:white;border:0;border-radius:6px}</style>
-<h1>航班恢复控制台</h1><p>查看航班、中断事件与恢复方案。写操作使用 JSON API 并携带 X-User-Id、X-Role。</p><section><input id="u" value="ops"><input id="r" value="ops_manager"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#0f766e;color:white;border:0;border-radius:6px}button.retry{background:#b45309}.badge{display:inline-block;padding:2px 8px;border-radius:10px;color:white;font-size:12px;margin-right:6px}.merged{background:#15803d}.conflict{background:#b91c1c}.failed{background:#7f1d1d}.queued,.processing{background:#475569}.superseded{background:#6b7280}.pending{background:#b45309}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #e5e7eb;font-size:14px}.muted{color:#6b7280;font-size:13px}</style>
+<h1>航班恢复控制台</h1><p>查看航班、中断事件、恢复方案与离线批次合并结果。写操作使用 JSON API 并携带 X-User-Id、X-Role。</p>
+<section><input id="u" value="ops"><input id="r" value="ops_manager"><button onclick="load()">刷新</button><span id="msg" class="muted"></span></section>
+<section><h2>离线批次</h2><div id="batches">加载中…</div></section>
+<section><h2>待处理冲突</h2><div id="conflicts">加载中…</div></section>
+<section><h2>航班 / 方案状态</h2><pre id="o"></pre></section>
+<script>
+function h(s){return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&","<":"<",">":">",'"':"""}[c]))}
+function badge(st){return '<span class="badge '+h(st)+'">'+h(st)+'</span>'}
+async function api(path,opts){let x=await fetch(path,opts);let j=await x.json();if(!x.ok)throw new Error((j.error||"error")+": "+(j.message||""));return j}
+async function retry(id){msg("重试中…");try{await api('/api/batches/'+id+'/retry',{method:'POST',headers:{'X-User-Id':u.value,'X-Role':r.value}});msg('批次 '+id+' 已重试');await load()}catch(e){msg('重试失败: '+e.message)}}
+function msg(t){document.getElementById('msg').textContent=t}
+function renderBatches(list){
+  if(!list.length){document.getElementById('batches').innerHTML='<p class="muted">没有待处理的离线批次。</p>';return}
+  let rows=list.map(b=>{
+    let res=b.result||{},err=b.error||{};
+    let detail='';
+    if(b.status==='merged')detail='已合并：生效改派 '+res.applied_operations+' 条，同航班最后写入覆盖 '+res.superseded+' 条';
+    else if(b.status==='conflict')detail='冲突：校验问题 '+res.validation_problems+' 项，锁定资源冲突 '+res.locked_conflicts+' 项；生效 '+res.applied_operations+' 条，覆盖 '+res.superseded+' 条';
+    else if(b.status==='failed')detail='失败原因：'+h(err.code)+' '+h(err.message)+(err.operation_seq?('（操作序号 '+err.operation_seq+'）'):'');
+    else detail='排队/处理中，断点 '+b.checkpoint+'，尝试 '+b.attempts+' 次';
+    let btn=(b.status==='failed'||b.status==='conflict')?('<button class="retry" onclick="retry('+b.id+')">从断点重试</button>'):'';
+    return '<tr><td>#'+b.id+'</td><td>'+h(b.plan_name)+'<br><span class="muted">方案#'+b.plan_id+' 基线v'+b.baseline_revision+'</span></td><td>'+badge(b.status)+'</td><td>'+detail+'</td><td>'+h(b.submitted_by)+'<br><span class="muted">'+h(b.submitted_at)+'</span></td><td>'+btn+'</td></tr>';
+  }).join('');
+  document.getElementById('batches').innerHTML='<table><tr><th>批次</th><th>方案</th><th>状态</th><th>合并结果 / 失败原因</th><th>提交人</th><th>操作</th></tr>'+rows+'</table>';
+}
+function renderConflicts(list){
+  if(!list.length){document.getElementById('conflicts').innerHTML='<p class="muted">没有待处理冲突。</p>';return}
+  let rows=list.map(c=>{let d={};try{d=JSON.parse(c.detail_json)}catch(e){}
+    return '<tr><td>批次#'+c.batch_id+'</td><td>'+badge(c.code)+'</td><td>'+h(d.flight_no||d.flight_id||'')+'</td><td>'+h(d.resource||d.code||'')+'</td><td>'+h(d.conflict_plan||'')+'</td><td class="muted">'+h(c.created_at)+'</td></tr>'}).join('');
+  document.getElementById('conflicts').innerHTML='<table><tr><th>来源</th><th>类型</th><th>航班</th><th>资源</th><th>冲突方案</th><th>时间</th></tr>'+rows+'</table>';
+}
+async function load(){
+  try{
+    let s=await api('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});
+    renderBatches(s.pending_batches||[]);renderConflicts(s.pending_conflicts||[]);
+    o.textContent=JSON.stringify({flights:s.flights,plans:s.plans,server_time:s.server_time},null,2);
+    msg('已刷新 '+s.server_time);
+  }catch(e){msg('加载失败: '+e.message)}
+}
+load()
+</script>

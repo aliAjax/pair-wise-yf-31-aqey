@@ -18,6 +18,10 @@ python3 app.py --db airline_recovery.db
 - `POST /api/flights`、`POST /api/disruptions`：创建航班和中断。
 - `POST /api/recovery-plans`：一次提交方案及航班调整。
 - `POST /api/plans/{id}/assignments`：用 `expected_revision` 临时改派。
+- `POST /api/plans/{id}/batches`：提交离线批次（`batch_key` 幂等、`baseline_revision` 资源基线、`operations` 含 `seq` 操作序号）；同航班只认最后一次改派，合并后重新校验并检查锁定资源冲突。
+- `GET /api/plans/{id}/batches`、`GET /api/batches/{id}`：查询批次与合并结果。
+- `POST /api/batches/{id}/retry`：从断点重试失败或存在待处理冲突的批次。
+- `POST /api/batches/{id}/conflicts/{cid}/resolve`：处理（ignored/resolved）待处理冲突。
 - `POST /api/plans/{id}/validate`、`/lock`：校验并原子锁定方案。
 - `GET /api/disruptions/{id}/compare`：比较恢复方案成本。
 - `POST /api/flights/{id}/cancel`、`/recover`：取消和人工恢复。
